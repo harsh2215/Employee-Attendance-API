@@ -33,6 +33,7 @@ EPOCH_MS_MAX = 4_102_444_800_000
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.employees.create_index("emp_code", unique=True)
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     yield
 
 
@@ -42,11 +43,35 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    """R2: Compute late minutes of punch_in relative to shift_start. If punch_in is within 10 minutes of shift_start, return 0."""
+def ms_to_utc(ms: int) -> datetime:
+    """Epoch milliseconds to UTC datetime. R1: truncated to whole seconds before
+    any calculation, so the sub-second remainder of ms is dropped, not rounded."""
+    return datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
+
+
+def to_ist(dt: datetime) -> datetime:
+    """Any datetime -> IST wall-clock time. A naive value is treated as UTC."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
+
+
+def resolve_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
+    """R1: a record's date is the IST calendar date of punch_in, except for an overnight
+    shift (shift_end <= shift_start): if the IST punch time is before shift_end, it
+    belongs to the shift that started the day before."""
+    punch_ist = to_ist(punch_in_utc)
+    is_overnight = shift_end <= shift_start
+    if is_overnight and punch_ist.strftime("%H:%M") < shift_end:
+        punch_ist -= timedelta(days=1)
+    return punch_ist.date().isoformat()
+
+
+def compute_late_minutes(punch_in_ist: datetime, shift_start: str, attendance_date: str) -> int:
+    """R2: late only if strictly more than 10:00 after shift_start."""
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    diff_seconds = (punch_in - start).total_seconds()
+    start = datetime.fromisoformat(attendance_date).replace(hour=h, minute=m, tzinfo=punch_in_ist.tzinfo)
+    diff_seconds = (punch_in_ist - start).total_seconds()
     if diff_seconds <= 600:
         return 0
     return int(diff_seconds // 60)
@@ -75,9 +100,37 @@ def to_epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def serialize_attendance(doc: dict) -> dict:
+    """Serialize Mongo attendance document for the API: drop _id, turn punch_in/punch_out
+    (and history's dates) into epoch-ms, and fill in the defaults legacy records omit."""
+    doc.pop("_id", None)
+    doc["punch_in"] = to_epoch_ms(doc["punch_in"]) if doc.get("punch_in") else None
+    doc["punch_out"] = to_epoch_ms(doc["punch_out"]) if doc.get("punch_out") else None
+    doc["half_day"] = doc.get("half_day", False)
+    history = []
+    for entry in doc.get("history", []):
+        changes = {}
+        for field, change in entry.get("changes", {}).items():
+            frm, to = change.get("from"), change.get("to")
+            changes[field] = {
+                "from": to_epoch_ms(frm) if isinstance(frm, datetime) else frm,
+                "to": to_epoch_ms(to) if isinstance(to, datetime) else to,
+            }
+        history.append({
+            "at": to_epoch_ms(entry["at"]),
+            "by": entry["by"],
+            "reason": entry["reason"],
+            "changes": changes,
+        })
+    doc["history"] = history
+    return doc
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+
+
 EMP_CODE_PATTERN = r"^EMP\d{4,6}$"
 TIME_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
 EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
@@ -118,6 +171,8 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
+
+
 @app.get("/health")
 def health():
     try:
@@ -161,26 +216,30 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(404, "unknown employee")
+
+    punch_utc = ms_to_utc(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc).replace(microsecond=0)
+    punch_ist = to_ist(punch_utc)
+    attendance_date = resolve_attendance_date(punch_utc, emp["shift_start"], emp["shift_end"])
+
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": attendance_date,
         "status": body.status,
-        "punch_in": ts,
+        "punch_in": punch_utc,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(punch_ist, emp["shift_start"], attendance_date),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return serialize_attendance(doc)
 
 
 @app.get("/attendance")
@@ -188,10 +247,13 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
@@ -203,13 +265,12 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    skip = (page - 1) * page_size
+    total = db.attendance_logs.count_documents(q)
+    cursor = db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size)
+    items = [serialize_attendance(doc) for doc in cursor]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
