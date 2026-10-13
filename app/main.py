@@ -9,14 +9,16 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -27,7 +29,14 @@ IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH_MS_MIN = 100_000_000_000
 EPOCH_MS_MAX = 4_102_444_800_000
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.employees.create_index("emp_code", unique=True)
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +65,14 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m)
     minutes = max(0, int((punch_out - end).total_seconds() // 60))
     return minutes if minutes >= 30 else 0
+
+
+def to_epoch_ms(dt: datetime) -> int:
+    """datetime -> epoch milliseconds. A naive value (what PyMongo returns by default)
+    is treated as UTC, since that's what BSON dates actually store."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
 # --------------------------------------------------------------------------- #
@@ -103,28 +120,41 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except Exception:
+        raise HTTPException(503, "database unavailable")
     return {"status": "ok"}
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+    doc["created_at"] = datetime.now(timezone.utc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
     doc.pop("_id", None)
+    doc["created_at"] = to_epoch_ms(doc["created_at"])
     return doc
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    items = []
+    for doc in db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size):
+        doc["created_at"] = to_epoch_ms(doc["created_at"])
+        items.append(doc)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
