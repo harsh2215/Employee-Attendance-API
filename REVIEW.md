@@ -31,4 +31,11 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 Also note anything you looked at and decided was **not** a defect, and why.
 
 - `list_employees()`'s `department` filter does an exact, case-sensitive match on the stored value with no extra normalisation (lowercasing, trimming, etc.). The contract explicitly says department matching is "exact, case-sensitive," so this is correct as written, not a bug.
-- `compute_overtime()`'s handling of an overnight shift's end date (the shift end actually falls on the day after the record's date) is not yet fixed — this function isn't called by any endpoint in the starter yet (it's wired up for `punch-out`, which doesn't exist until Part B), so it's being addressed when that endpoint is built rather than in isolation here.
+- `compute_overtime()`'s overnight-shift-end-date bug is now fixed as part of building `punch-out` below, since that's the endpoint that actually calls it.
+
+## Part B endpoints
+
+Overview on the newly added endpoints
+
+- **`POST /attendance/punch-out`**: finds the employee's most recent still-open record whose `punch_in` is at or before the given time (so it works across midnight for overnight shifts), validates the timing window, after then closes it with an atomic compare-and-swap update so two simultaneous punch-outs can't both succeed.
+- **`PATCH /attendance/{emp_code}/{date}`**: applies only the supplied changes, enforces the ABSENT/LEAVE-clears-punches and presence-requires-punch_in rules, recomputes all derived fields from the final state, and diffs old vs. new values to build the `history` entry. Uses an optimistic lock (the current length of `history`) so a concurrent edit can't silently overwrite another one's history entry.
