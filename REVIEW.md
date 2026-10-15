@@ -31,11 +31,25 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 Also note anything you looked at and decided was **not** a defect, and why.
 
 - `list_employees()`'s `department` filter does an exact, case-sensitive match on the stored value with no extra normalisation (lowercasing, trimming, etc.). The contract explicitly says department matching is "exact, case-sensitive," so this is correct as written, not a bug.
-- `compute_overtime()`'s overnight-shift-end-date bug is now fixed as part of building `punch-out` below, since that's the endpoint that actually calls it.
+- `compute_overtime()`'s overnight-shift-end-date bug is now fixed as part of building `punch-out` (Part B), since that's the endpoint that actually calls it.
 
-## Part B endpoints
+## Part B endpoints (new, not in the starter)
 
-Overview on the newly added endpoints
+Brief note on each, since these weren't reviewed defects:
 
-- **`POST /attendance/punch-out`**: finds the employee's most recent still-open record whose `punch_in` is at or before the given time (so it works across midnight for overnight shifts), validates the timing window, after then closes it with an atomic compare-and-swap update so two simultaneous punch-outs can't both succeed.
-- **`PATCH /attendance/{emp_code}/{date}`**: applies only the supplied changes, enforces the ABSENT/LEAVE-clears-punches and presence-requires-punch_in rules, recomputes all derived fields from the final state, and diffs old vs. new values to build the `history` entry. Uses an optimistic lock (the current length of `history`) so a concurrent edit can't silently overwrite another one's history entry.
+- **`POST /attendance/punch-out`**: finds the employee's most recent still-open record whose `punch_in` is at or before the given time, validates the timing window, then closes it with an atomic compare-and-swap so two simultaneous punch-outs can't both succeed.
+- **`PATCH /attendance/{emp_code}/{date}`**: applies only the supplied changes, enforces the ABSENT/LEAVE and presence-requires-punch_in rules, recomputes all derived fields, and diffs old vs. new values into the `history` entry. Uses an optimistic lock on `history`'s length so a concurrent edit can't overwrite another one's entry.
+- **`GET /analytics/employees/{emp_code}/monthly`**: `working_days` (R7) is a plain calendar calculation; everything else is one aggregation over `attendance_logs`.
+- **`GET /analytics/departments/summary`**: headcount (R9) comes from `employees`; the rest from `attendance_logs` via a per-record lookup to get `department`; merged by department in Python.
+- **`GET /analytics/leaderboard/late`**: one aggregation that totals late minutes per employee, then uses MongoDB's own ranking function so ties share a rank and the next rank is skipped, the way the spec asks.
+- **`GET /analytics/departments/{department}/trend`**: one aggregation that fills in every missing calendar day (so weekends and no-record days still show up), works out each day's headcount and attendance rate, and computes the 7-day moving average, all inside MongoDB rather than looping over days in Python.
+
+### Testign strategy
+
+An actual run against a real MongoDB with the sample data loaded, and hit with real HTTP requests:
+
+- Started the app for real (Docker + MongoDB) and called every new endpoint with `curl`, checking the numbers that came back by hand against the nine sample records.
+- For the two "exactly one request should win" rules (punch-out, regularize), fired two requests at the very same moment at the same record and checked that exactly one got back a success and the other got the right error. This is how two real bugs were caught and fixed: punch-out was returning 404 instead of 409 for the losing request, and regularize was wrongly rejecting a perfectly fine edit on an older record that didn't have a `history` field yet. (for more load: we caan use Locust to test the endpoints.)
+- For the late leaderboard's tie handling, added a few extra employees with matching late-minute totals on purpose, to check that tied employees share a rank, the next rank gets skipped and `limit` still returns every tied employee at the cutoff rank rather than cutting the list short.
+- For the department trend, checked a date range by hand day by day: which days are working days, whether a brand-new employee is correctly excluded from headcount before they join, and whether the 7-day average is using the right set of earlier days (and a shorter window at the very start of the range).
+- Checked the error cases too: wrong employee code, unknown department, a date range that doesn't make sense, and a date range that's too long - each one came back with the status code the contract asks for.
