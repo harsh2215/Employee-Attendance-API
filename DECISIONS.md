@@ -1,7 +1,7 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# DECISIONS.md
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** Two: a unique index on `employees.emp_code` (makes employee creation race-safe and backs every lookup by emp_code), and a unique compound index on `attendance_logs.(emp_code, date)` (enforces one record per employee per day, makes punch-in race-safe, and backs queries that filter by employee plus a date range). We considered a plain `date` index for the aggregations that scan across all employees for a month or range (leaderboard, department summary/trend), but held off adding it without an explain endpoint to actually measure whether it was needed.
+2. **Punch-in race.** There's no check-then-insert: both requests just try to insert their own document directly. The unique `(emp_code, date)` index means MongoDB itself only lets one insert succeed; the loser gets a duplicate-key error, which we catch and turn into a 409. Whichever insert lands first wins the 201.
+3. **Ties.** The leaderboard ranks with MongoDB's own ranking function, which gives standard competition ranking: tied employees share a rank, and the next rank is skipped. `limit` is applied after ranking (every row with rank <= limit), so two employees tied exactly at the cutoff both come back, even if that makes the list longer than `limit`.
+4. **Headcount.** Headcount is computed by counting `employees` alone (anyone who joined on or before month-end), with no dependency on `attendance_logs`. Attendance-based numbers are computed separately and merged in afterward, defaulting to zero - so someone with zero logs still gets counted.
+5. **At 100x the data.** Add a dedicated `date` index for the queries that scan across all employees (leaderboard, department summary/trend), since those only benefit from an index today when a specific employee is also part of the filter.

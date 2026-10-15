@@ -15,11 +15,21 @@ much larger and contains cases they do not show.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
+# create a .env with MONGO_URI / MONGO_DB, e.g.:
+#   MONGO_URI="mongodb://localhost:27017"
+#   MONGO_DB="attendance_db"
+docker run -d --name mongo -p 27017:27017 mongo:7   # or use MongoDB Atlas (M0 free tier) instead
 python sample_seed.py
 uvicorn app.main:app --port 8000 --reload
 ```
 MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+
+## What's missing
+
+`GET /admin/explain/{endpoint}` is not implemented due to time constraing. Every other endpoint in `openapi.yaml` is: employee create/list,
+punch-in, punch-out, attendance list, regularize, and all four analytics endpoints (employee monthly, department
+summary, late leaderboard, department trend). `DECISIONS.md`'s indexing answer is based on reasoning about the
+queries rather than on `explain` output, since the endpoint that would prove it doesn't exist here.
 
 ## Submit
 A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
